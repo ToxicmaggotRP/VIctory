@@ -500,3 +500,53 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+
+#[cfg(test)]
+mod buffer_state_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Records state changes across several host lists and lets D3D12's debug
+    /// layer validate the actual barriers. Run alone with
+    /// VICTORY_D3D12_DEBUG=1 (and optionally VICTORY_D3D12_WARP=1).
+    #[test]
+    fn buffer_state_transitions_are_valid_across_command_lists() {
+        let Some(host) = crate::host::host() else {
+            return; // no D3D12 adapter available
+        };
+        let Some((buffer, data)) = host.shared_buffer(64 << 10) else {
+            return; // custom CPU-visible UAV buffers are unavailable
+        };
+        // SAFETY: the buffer was successfully created and is live.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Arc::new(Shadow::new(buffer, data, gpu, 0x1_0000, 64 << 10));
+
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+        let read = D3D12_RESOURCE_STATE_INDEX_BUFFER.0 as u32;
+
+        let first = host.new_list().expect("create first command list");
+        first.transition_buffer(&shadow, uav);
+        first.close();
+
+        // Same-state UAV use in the next list must still get a UAV barrier.
+        let second = host.new_list().expect("create second command list");
+        second.transition_buffer(&shadow, uav);
+        second.close();
+
+        let third = host.new_list().expect("create third command list");
+        third.transition_buffer(&shadow, read);
+        third.close();
+
+        let fourth = host.new_list().expect("create fourth command list");
+        fourth.transition_buffer(&shadow, uav);
+        fourth.close();
+
+        host.execute(&[&first, &second, &third, &fourth]);
+        assert_eq!(shadow.state.load(Ordering::Relaxed), uav);
+
+        if let Some(error) = host.log_messages() {
+            panic!("D3D12 debug layer rejected shadow-buffer barriers: {error}");
+        }
+    }
+}
