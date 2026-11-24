@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use crate::descriptor::View;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     /// Title memory, `start..end`.
     Buffer(u64, u64),
@@ -124,16 +124,65 @@ pub(crate) fn dropped_target(writer: &str, resource: usize) {
     }
 }
 
-/// Work that runs writes through `view`: what it writes is produced.
+/// Work that runs writes through `view`: only the bytes it actually writes
+/// are no longer attributed to a dropped producer. Any untouched part of an
+/// earlier dropped range remains a possible stale read.
 pub(crate) fn live_write(view: &View) {
     if !on() {
         return;
     }
-    if let Some(what) = target_of(view) {
-        WRITES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|w| !w.what.overlaps(what));
+    let Some(written) = target_of(view) else {
+        return;
+    };
+
+    const MAX_WRITES: usize = 8192;
+    let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = std::mem::take(&mut *writes);
+    let mut remaining = Vec::with_capacity(previous.len());
+
+    for write in previous {
+        for what in unwritten_parts(write.what, written) {
+            remaining.push(Write {
+                what,
+                writer: write.writer.clone(),
+                frame: write.frame,
+            });
+        }
+    }
+
+    // Range splitting can create more entries than it consumes. Keep the
+    // detector bounded just as record() does, dropping the oldest entries.
+    if remaining.len() > MAX_WRITES {
+        remaining.drain(..remaining.len() - MAX_WRITES);
+    }
+    *writes = remaining;
+}
+
+/// The portions of `target` not overwritten by `written`.
+///
+/// Buffer ranges are half-open. A write in the middle leaves both the prefix
+/// and suffix attributed to the dropped producer; a write covering the whole
+/// range removes it. Textures are tracked as indivisible resources.
+fn unwritten_parts(target: Target, written: Target) -> Vec<Target> {
+    match (target, written) {
+        (Target::Buffer(start, end), Target::Buffer(write_start, write_end)) => {
+            let overlap_start = start.max(write_start);
+            let overlap_end = end.min(write_end);
+            if overlap_start >= overlap_end {
+                return vec![target];
+            }
+
+            let mut remaining = Vec::with_capacity(2);
+            if start < overlap_start {
+                remaining.push(Target::Buffer(start, overlap_start));
+            }
+            if overlap_end < end {
+                remaining.push(Target::Buffer(overlap_end, end));
+            }
+            remaining
+        }
+        (Target::Texture(a), Target::Texture(b)) if a == b => Vec::new(),
+        _ => vec![target],
     }
 }
 
@@ -177,5 +226,82 @@ pub(crate) fn read(view: &View) {
                 "reads what only dropped work writes"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Target, unwritten_parts};
+
+    #[test]
+    fn partial_buffer_write_preserves_both_unwritten_sides() {
+        assert_eq!(
+            unwritten_parts(Target::Buffer(0x1000, 0x2000), Target::Buffer(0x1400, 0x1800)),
+            vec![
+                Target::Buffer(0x1000, 0x1400),
+                Target::Buffer(0x1800, 0x2000),
+            ],
+        );
+    }
+
+    #[test]
+    fn buffer_write_trims_a_prefix_or_suffix() {
+        assert_eq!(
+            unwritten_parts(Target::Buffer(0x1000, 0x2000), Target::Buffer(0x0800, 0x1400)),
+            vec![Target::Buffer(0x1400, 0x2000)],
+        );
+        assert_eq!(
+            unwritten_parts(Target::Buffer(0x1000, 0x2000), Target::Buffer(0x1800, 0x2800)),
+            vec![Target::Buffer(0x1000, 0x1800)],
+        );
+    }
+
+    #[test]
+    fn covering_buffer_write_removes_the_stale_range() {
+        assert!(
+            unwritten_parts(Target::Buffer(0x1000, 0x2000), Target::Buffer(0x0800, 0x2800))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn disjoint_and_adjacent_buffer_writes_leave_the_range_unchanged() {
+        let target = Target::Buffer(0x1000, 0x2000);
+        assert_eq!(
+            unwritten_parts(target, Target::Buffer(0x2000, 0x3000)),
+            vec![target],
+        );
+        assert_eq!(
+            unwritten_parts(target, Target::Buffer(0x0800, 0x1000)),
+            vec![target],
+        );
+        assert_eq!(
+            unwritten_parts(target, Target::Buffer(0x3000, 0x4000)),
+            vec![target],
+        );
+    }
+
+    #[test]
+    fn textures_are_removed_only_by_a_write_to_the_same_texture() {
+        assert!(
+            unwritten_parts(Target::Texture(7), Target::Texture(7)).is_empty()
+        );
+        assert_eq!(
+            unwritten_parts(Target::Texture(7), Target::Texture(8)),
+            vec![Target::Texture(7)],
+        );
+    }
+
+    #[test]
+    fn buffer_and_texture_targets_do_not_overlap() {
+        let buffer = Target::Buffer(0x1000, 0x2000);
+        assert_eq!(
+            unwritten_parts(buffer, Target::Texture(7)),
+            vec![buffer],
+        );
+        assert_eq!(
+            unwritten_parts(Target::Texture(7), buffer),
+            vec![Target::Texture(7)],
+        );
     }
 }
