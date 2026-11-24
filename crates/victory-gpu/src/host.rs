@@ -17,6 +17,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::buffer_state::{Barrier as BufferBarrier, BufferState};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -292,6 +294,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Host buffer states the list assumes, by host copy.
+    buffer_states: Mutex<BufferStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -320,6 +324,11 @@ type Note = (String, Option<(u64, u64)>);
 type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
+>;
+
+type BufferStates = std::collections::HashMap<
+    usize,
+    (BufferState, std::sync::Arc<crate::shadow::Shadow>),
 >;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
@@ -476,6 +485,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -880,6 +890,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -923,6 +934,40 @@ impl HostList {
         }
     }
 
+    /// Tracks the host copy of a title buffer in this list. Read-only buffer
+    /// uses share GENERIC_READ; UAV uses remain exclusive. The first access
+    /// is handled by the submission prelude, later accesses are barriers in
+    /// the recorded list.
+    pub(crate) fn transition_buffer(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        wanted: u32,
+    ) {
+        let barrier = {
+            let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+            match states.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((BufferState::new(wanted), shadow.clone()));
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().0.record(wanted),
+            }
+        };
+        let Some(barrier) = barrier else {
+            return;
+        };
+        let barrier = match barrier {
+            BufferBarrier::Transition { before, after } => transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(after as i32),
+            ),
+            BufferBarrier::Uav => uav_barrier(Some(&shadow.buffer)),
+        };
+        // SAFETY: an open command list and a live shadow buffer.
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
@@ -941,6 +986,22 @@ impl HostList {
                 })
             })
             .collect();
+        let buffer_states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        let buffer_barriers = buffer_states
+            .values()
+            .filter_map(|(state, shadow)| {
+                let actual = shadow.state.swap(state.submitted_state(), Ordering::Relaxed);
+                match state.prelude(actual) {
+                    Some(BufferBarrier::Transition { before, after }) => Some(transition(
+                        &shadow.buffer,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATES(after as i32),
+                    )),
+                    Some(BufferBarrier::Uav) => Some(uav_barrier(Some(&shadow.buffer))),
+                    None => None,
+                }
+            });
+        barriers.extend(buffer_barriers);
         if barriers.is_empty() {
             return None;
         }
@@ -1886,6 +1947,20 @@ pub(crate) fn transition(
                 Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 StateBefore: before,
                 StateAfter: after,
+            }),
+        },
+    }
+}
+
+/// An unordered-access barrier for one buffer, or every UAV when resource is
+/// None. A resource-specific barrier keeps unrelated UAV traffic independent.
+pub(crate) fn uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(resource.cloned()),
             }),
         },
     }
