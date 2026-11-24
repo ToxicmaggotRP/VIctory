@@ -504,7 +504,9 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod buffer_state_tests {
-    use super::*;
+    use super::Shadow;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D12::*;
 
     /// Records state changes across several host lists and lets D3D12's debug
