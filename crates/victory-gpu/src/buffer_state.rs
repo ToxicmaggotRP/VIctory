@@ -99,7 +99,13 @@ mod tests {
 
     #[test]
     fn read_only_accesses_share_generic_read_state() {
-        for access in [VERTEX, INDEX, SHADER_RESOURCE, INDIRECT_ARGUMENT, GENERIC_READ] {
+        for access in [
+            VERTEX,
+            INDEX,
+            SHADER_RESOURCE,
+            INDIRECT_ARGUMENT,
+            GENERIC_READ,
+        ] {
             let state = BufferState::new(access);
             assert_eq!(state.submitted_state(), GENERIC_READ, "access {access:#x}");
         }
@@ -173,10 +179,7 @@ mod tests {
         let first = BufferState::new(UNORDERED_ACCESS);
         let second = BufferState::new(UNORDERED_ACCESS);
 
-        assert_eq!(
-            second.prelude(first.submitted_state()),
-            Some(Barrier::Uav)
-        );
+        assert_eq!(second.prelude(first.submitted_state()), Some(Barrier::Uav));
     }
 
     #[test]
