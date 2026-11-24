@@ -646,7 +646,8 @@ impl Host {
             };
         }
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return "; DRED was enabled, but ID3D12DeviceRemovedExtendedData1 is unavailable".into();
+            return "; DRED was enabled, but ID3D12DeviceRemovedExtendedData1 is unavailable"
+                .into();
         };
         let mut text = String::new();
         let mut fault_va = None;
