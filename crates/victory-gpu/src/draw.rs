@@ -142,6 +142,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        let wanted = if srv {
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32
+                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32
+        } else {
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32
+        };
+        list.transition_buffer(&shadow, wanted);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -361,6 +368,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.transition_buffer(&shadow, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -379,6 +387,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.transition_buffer(&shadow, D3D12_RESOURCE_STATE_INDEX_BUFFER.0 as u32);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -976,9 +985,10 @@ impl State {
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
+            list.transition_buffer(s, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -997,7 +1007,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1021,7 +1031,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1085,6 +1095,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.transition_buffer(&shadow, UNORDERED_ACCESS);
+        } else if u.kind == ResourceType::Cbv {
+            list.transition_buffer(&shadow, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32);
+        } else if u.kind == ResourceType::Srv {
+            list.transition_buffer(&shadow, SHADER_RESOURCE);
         }
     }
     match (view, u.kind) {
