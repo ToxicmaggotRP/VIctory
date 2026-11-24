@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -27,6 +27,8 @@ use crate::watch::PAGE;
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// Actual host D3D12 state, committed in submission order (starts COMMON).
+    pub(crate) state: AtomicU32,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -110,6 +112,7 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
+            state: AtomicU32::new(0),
             data,
             gpu,
             start,
@@ -496,4 +499,54 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+
+#[cfg(test)]
+mod buffer_state_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Records state changes across several host lists and lets D3D12's debug
+    /// layer validate the actual barriers. Run alone with
+    /// VICTORY_D3D12_DEBUG=1 (and optionally VICTORY_D3D12_WARP=1).
+    #[test]
+    fn buffer_state_transitions_are_valid_across_command_lists() {
+        let Some(host) = crate::host::host() else {
+            return; // no D3D12 adapter available
+        };
+        let Some((buffer, data)) = host.shared_buffer(64 << 10) else {
+            return; // custom CPU-visible UAV buffers are unavailable
+        };
+        // SAFETY: the buffer was successfully created and is live.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Arc::new(Shadow::new(buffer, data, gpu, 0x1_0000, 64 << 10));
+
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+        let read = D3D12_RESOURCE_STATE_INDEX_BUFFER.0 as u32;
+
+        let first = host.new_list().expect("create first command list");
+        first.transition_buffer(&shadow, uav);
+        first.close();
+
+        // Same-state UAV use in the next list must still get a UAV barrier.
+        let second = host.new_list().expect("create second command list");
+        second.transition_buffer(&shadow, uav);
+        second.close();
+
+        let third = host.new_list().expect("create third command list");
+        third.transition_buffer(&shadow, read);
+        third.close();
+
+        let fourth = host.new_list().expect("create fourth command list");
+        fourth.transition_buffer(&shadow, uav);
+        fourth.close();
+
+        host.execute(&[&first, &second, &third, &fourth]);
+        assert_eq!(shadow.state.load(Ordering::Relaxed), uav);
+
+        if let Some(error) = host.log_messages() {
+            panic!("D3D12 debug layer rejected shadow-buffer barriers: {error}");
+        }
+    }
 }
