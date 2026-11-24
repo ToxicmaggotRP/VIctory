@@ -1,0 +1,14 @@
+name: Temporary D3D12 buffer-state validation
+
+on:
+  push:
+    branches:
+      - gpu/d3d12-buffer-state-tracking
+
+jobs:
+  buffer-state-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run buffer-state regression tests
+        run: cargo test --locked -p victory-gpu buffer_state::tests -- --nocapture
