@@ -52,6 +52,8 @@ struct Write {
     frame: u64,
 }
 
+const MAX_TRACKED_WRITES: usize = 8192;
+
 static WRITES: Mutex<Vec<Write>> = Mutex::new(Vec::new());
 static SEEN: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
@@ -96,7 +98,7 @@ fn record(what: Target, writer: &str) {
     let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     // What the frame before last dropped is history: the title has moved on.
     writes.retain(|w| w.frame + 2 > frame);
-    if writes.len() >= 8192 {
+    if writes.len() >= MAX_TRACKED_WRITES {
         writes.remove(0);
     }
     if !writes.iter().any(|w| w.what == what && w.writer == writer) {
@@ -135,7 +137,6 @@ pub(crate) fn live_write(view: &View) {
         return;
     };
 
-    const MAX_WRITES: usize = 8192;
     let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     let previous = std::mem::take(&mut *writes);
     let mut remaining = Vec::with_capacity(previous.len());
@@ -152,8 +153,8 @@ pub(crate) fn live_write(view: &View) {
 
     // Range splitting can create more entries than it consumes. Keep the
     // detector bounded just as record() does, dropping the oldest entries.
-    if remaining.len() > MAX_WRITES {
-        remaining.drain(..remaining.len() - MAX_WRITES);
+    if remaining.len() > MAX_TRACKED_WRITES {
+        remaining.drain(..remaining.len() - MAX_TRACKED_WRITES);
     }
     *writes = remaining;
 }
