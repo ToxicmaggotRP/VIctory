@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -51,6 +51,10 @@ pub(crate) struct Host {
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
+    /// Whether DRED was successfully enabled before creating the device.
+    dred_enabled: bool,
+    /// Why DRED could not be enabled, if it was requested.
+    dred_setup_error: Option<String>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
 }
@@ -161,17 +165,33 @@ fn create() -> windows::core::Result<Host> {
                 tracing::info!("GPU-based validation on");
             }
         }
-        // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
-        if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        // DRED settings are process-wide and must be set before creating
+        // the device. Keep the failure instead of silently producing an
+        // unsupported GetAutoBreadcrumbsOutput call after device removal.
+        let (dred_enabled, dred_setup_error) = if dred_requested() {
+            let mut settings: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+            match D3D12GetDebugInterface(&mut settings) {
+                Ok(()) => match settings {
+                    Some(settings) => {
+                        settings.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        settings.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        tracing::info!("DRED auto-breadcrumbs and page-fault tracking enabled");
+                        (true, None)
+                    }
+                    None => {
+                        let reason = "D3D12GetDebugInterface returned no DRED settings interface";
+                        tracing::warn!("{reason}");
+                        (false, Some(reason.to_owned()))
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(error = %error, "DRED requested but settings interface is unavailable");
+                    (false, Some(error.to_string()))
+                }
             }
-        }
+        } else {
+            (false, None)
+        };
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
@@ -184,6 +204,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        DRED_ENABLED.store(dred_enabled, Ordering::Relaxed);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -220,6 +241,8 @@ fn create() -> windows::core::Result<Host> {
             dsv_size,
             next_dsv: AtomicU32::new(0),
             messages,
+            dred_enabled,
+            dred_setup_error,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
@@ -322,13 +345,17 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether DRED was successfully enabled before the host device was made.
+static DRED_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether device-removed data was requested for this diagnostics run.
+fn dred_requested() -> bool {
+    cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+}
+
+/// Whether command markers and object names should be recorded for DRED.
 pub(crate) fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    DRED_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -610,8 +637,16 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        if !self.dred_enabled {
+            return match self.dred_setup_error.as_deref() {
+                Some(error) => format!(
+                    "; DRED requested but could not be enabled before device creation: {error}"
+                ),
+                None => "; DRED disabled (set VICTORY_D3D12_DRED=1 in a diagnostics build to capture breadcrumbs and page faults)".into(),
+            };
+        }
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return "; DRED was enabled, but ID3D12DeviceRemovedExtendedData1 is unavailable".into();
         };
         let mut text = String::new();
         let mut fault_va = None;
