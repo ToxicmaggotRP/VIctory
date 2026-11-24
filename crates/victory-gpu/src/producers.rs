@@ -126,9 +126,10 @@ pub(crate) fn dropped_target(writer: &str, resource: usize) {
     }
 }
 
-/// Work that runs writes through `view`: only the bytes it actually writes
-/// are no longer attributed to a dropped producer. Any untouched part of an
-/// earlier dropped range remains a possible stale read.
+/// Work that runs writes through `view`: the portion of an earlier
+/// dropped buffer range covered by this declared write view is no longer
+/// attributed to that producer. The view extent is conservative; this does
+/// not track the individual bytes a shader actually stores.
 pub(crate) fn live_write(view: &View) {
     if !on() {
         return;
