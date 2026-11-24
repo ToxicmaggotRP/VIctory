@@ -18,6 +18,7 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+mod buffer_state;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
