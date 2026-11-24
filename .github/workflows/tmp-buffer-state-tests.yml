@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - gpu/d3d12-buffer-state-tracking
+  pull_request:
+    branches:
+      - main
 
 jobs:
   buffer-state-tests:
