@@ -13,8 +13,26 @@ use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+// WARP's D3D12 implementation can fault when independent test threads
+// create and use multiple WARP devices concurrently. Keep this guard for the
+// lifetime of each test Host, so command recording and dispatch are serialized
+// too. Hardware-adapter tests remain parallel.
+#[cfg(test)]
+static WARP_HOST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn warp_host_lock(warp: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
+    warp.then(|| {
+        WARP_HOST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    })
+}
+
 pub struct Host {
     pub device: ID3D12Device,
+    #[cfg(test)]
+    _warp_lock: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -66,6 +84,10 @@ impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        // Hold the lock until this Host is dropped: serializing only device
+        // creation still lets two WARP command queues run concurrently.
+        #[cfg(test)]
+        let warp_lock = warp_host_lock(warp);
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -94,7 +116,11 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                #[cfg(test)]
+                _warp_lock: warp_lock,
+            })
         }
     }
 
@@ -1378,4 +1404,19 @@ impl Host {
             Ok(out)
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn warp_host_lock_excludes_concurrent_warp_hosts() {
+    let guard = warp_host_lock(true).expect("WARP host must acquire the test lock");
+    assert!(
+        WARP_HOST_LOCK.try_lock().is_err(),
+        "a second WARP host must wait while the first host is alive"
+    );
+    drop(guard);
+    assert!(
+        warp_host_lock(false).is_none(),
+        "hardware hosts must not take the WARP test lock"
+    );
 }
