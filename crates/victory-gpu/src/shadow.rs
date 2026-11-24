@@ -515,10 +515,12 @@ mod buffer_state_tests {
     #[test]
     fn buffer_state_transitions_are_valid_across_command_lists() {
         let Some(host) = crate::host::host() else {
-            return; // no D3D12 adapter available
+            eprintln!("SKIP: no D3D12 host adapter available");
+            return;
         };
         let Some((buffer, data)) = host.shared_buffer(64 << 10) else {
-            return; // custom CPU-visible UAV buffers are unavailable
+            eprintln!("SKIP: adapter cannot create a CPU-visible UAV buffer");
+            return;
         };
         // SAFETY: the buffer was successfully created and is live.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
